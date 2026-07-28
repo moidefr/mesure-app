@@ -2,6 +2,7 @@ package com.moidefr.mesureapp
 
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.graphics.PointF
 import android.media.ImageReader
 import android.os.Bundle
 import android.util.Log
@@ -9,24 +10,30 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -36,12 +43,15 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
-import com.moidefr.mesureapp.ar.createAnchorFromTap
+import com.moidefr.mesureapp.ar.createAnchorFromDetectedTap
+import com.moidefr.mesureapp.ar.detectTap
 import com.moidefr.mesureapp.ar.distanceBetween
+import com.moidefr.mesureapp.ar.hitTestDistance
 import com.moidefr.mesureapp.ar.rgbaImageToBitmap
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.node.AnchorNode
@@ -54,6 +64,8 @@ import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberOnGestureListener
 import io.github.sceneview.rememberSurfaceMirrorer
 import org.opencv.android.OpenCVLoader
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 private const val TAG = "MesureApp"
 
@@ -78,10 +90,22 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** A tapped/detected object's position, kept both in camera-image pixels (for distance math,
+ * stable regardless of screen rotation) and on-screen pixels (for drawing). */
+private data class MeasuredPoint2D(val imagePoint: PointF, val screenPoint: Offset)
+
 /**
- * First tap sets the target (cochonnet); every following tap adds a compared object (boule /
- * palet). Each compared object is colored on a green (closest to target) -> red (farthest)
- * gradient and labeled with its distance to the target, in cm.
+ * 2D mode (default): objects are detected and shown as flat markers drawn directly on the camera
+ * feed, in screen space. No 3D tracking, no billboarded labels — this is the right tool when the
+ * camera looks almost straight down at the play area, which is how pétanque/palets are actually
+ * measured. A single AR hit-test at the target gives the camera-to-ground depth, combined with
+ * the camera's focal length to convert pixel distances to real centimeters.
+ *
+ * 3D mode (optional): the original ARCore anchor + 3D marker pipeline, better suited to a camera
+ * held at an angle.
+ *
+ * In both modes: first tap sets the target (cochonnet), every following tap adds a compared
+ * object (boule / palet), colored on a green (closest to target) -> red (farthest) gradient.
  */
 @Composable
 private fun ArMeasureScreen() {
@@ -89,23 +113,32 @@ private fun ArMeasureScreen() {
     val engine = rememberEngine()
     val materialLoader = rememberMaterialLoader(engine)
 
+    var use3DMode by remember { mutableStateOf(false) }
+
+    // 3D mode state.
     var targetAnchor by remember { mutableStateOf<Anchor?>(null) }
     val comparedAnchors = remember { mutableStateListOf<Anchor>() }
-    var pendingTap by remember { mutableStateOf<Offset?>(null) }
     var distancesCm by remember { mutableStateOf<List<Float>>(emptyList()) }
 
+    // 2D mode state.
+    var target2D by remember { mutableStateOf<MeasuredPoint2D?>(null) }
+    val compared2D = remember { mutableStateListOf<MeasuredPoint2D>() }
+    var metersPerImagePixel by remember { mutableStateOf<Float?>(null) }
+    var distances2DCm by remember { mutableStateOf<List<Float>>(emptyList()) }
+
+    var pendingTap by remember { mutableStateOf<Offset?>(null) }
     var boxSizePx by remember { mutableStateOf(IntSize.Zero) }
     var frozenBitmap by remember { mutableStateOf<Bitmap?>(null) }
     val surfaceMirrorer = rememberSurfaceMirrorer()
 
     fun resetMeasurement() {
-        // AnchorNode already detaches its anchor as part of its own teardown when it leaves
-        // composition (AnchorNodeImpl.destroy() -> detachAnchor()); detaching it here ourselves,
-        // ahead of and separate from that, raced the node's per-frame update against an
-        // already-detached anchor before recomposition had actually removed it.
         targetAnchor = null
         comparedAnchors.clear()
         distancesCm = emptyList()
+        target2D = null
+        compared2D.clear()
+        metersPerImagePixel = null
+        distances2DCm = emptyList()
     }
 
     fun freezeFrame() {
@@ -134,28 +167,44 @@ private fun ArMeasureScreen() {
             materialLoader = materialLoader,
             surfaceMirrorer = surfaceMirrorer,
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
+            planeRenderer = use3DMode,
             onGestureListener = rememberOnGestureListener(
                 onSingleTapConfirmed = { motionEvent, _ ->
                     pendingTap = Offset(motionEvent.x, motionEvent.y)
                 },
             ),
-            onSessionUpdated = { session, frame ->
+            onSessionUpdated = { _, frame ->
                 pendingTap?.let { tap ->
                     pendingTap = null
-                    val result = createAnchorFromTap(session, frame, tap)
-                    if (result != null) {
-                        if (!result.circleDetected) {
-                            Toast.makeText(
-                                context,
-                                "Objet non détecté, point approximatif utilisé",
-                                Toast.LENGTH_SHORT,
-                            ).show()
+                    val detected = detectTap(frame, tap)
+                    if (!detected.circleDetected) {
+                        Toast.makeText(
+                            context,
+                            "Objet non détecté, point approximatif utilisé",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                    if (use3DMode) {
+                        createAnchorFromDetectedTap(frame, detected)?.let { anchor ->
+                            if (targetAnchor == null) {
+                                targetAnchor = anchor
+                            } else {
+                                comparedAnchors.add(anchor)
+                            }
                         }
-                        val currentTarget = targetAnchor
-                        if (currentTarget == null) {
-                            targetAnchor = result.anchor
+                    } else {
+                        if (metersPerImagePixel == null) {
+                            hitTestDistance(frame, detected)?.let { depthMeters ->
+                                val focalLengthPx = frame.camera.imageIntrinsics.focalLength
+                                val avgFocalLengthPx = (focalLengthPx[0] + focalLengthPx[1]) / 2f
+                                metersPerImagePixel = depthMeters / avgFocalLengthPx
+                            }
+                        }
+                        val point = MeasuredPoint2D(detected.imagePoint, detected.viewPoint)
+                        if (target2D == null) {
+                            target2D = point
                         } else {
-                            comparedAnchors.add(result.anchor)
+                            compared2D.add(point)
                         }
                     }
                 }
@@ -166,39 +215,53 @@ private fun ArMeasureScreen() {
                 } else {
                     emptyList()
                 }
+
+                val target2d = target2D
+                val scale = metersPerImagePixel
+                distances2DCm = if (target2d != null && scale != null) {
+                    compared2D.map { obj ->
+                        val dx = obj.imagePoint.x - target2d.imagePoint.x
+                        val dy = obj.imagePoint.y - target2d.imagePoint.y
+                        sqrt(dx * dx + dy * dy) * scale * 100f
+                    }
+                } else {
+                    emptyList()
+                }
             },
         ) {
-            targetAnchor?.let { anchor ->
-                AnchorNode(anchor = anchor) {
-                    val marker = remember(materialLoader) {
-                        materialLoader.createColorInstance(TargetColor)
-                    }
-                    SphereNode(radius = 0.03f, materialInstance = marker)
-                    TextNode(
-                        text = "Cible",
-                        position = Position(y = 0.08f),
-                        textColor = TargetColor.toArgb(),
-                    )
-                }
-            }
-            comparedAnchors.forEachIndexed { index, anchor ->
-                key(anchor) {
-                    val distanceCm = distancesCm.getOrNull(index)
-                    val color = distanceCm?.let { colorForRank(it, distancesCm) } ?: ClosestColor
+            if (use3DMode) {
+                targetAnchor?.let { anchor ->
                     AnchorNode(anchor = anchor) {
                         val marker = remember(materialLoader) {
-                            materialLoader.createColorInstance(color)
+                            materialLoader.createColorInstance(TargetColor)
                         }
-                        SideEffect { marker.setColor(color) }
                         SphereNode(radius = 0.03f, materialInstance = marker)
                         TextNode(
-                            text = buildString {
-                                append("Objet ${index + 1}")
-                                distanceCm?.let { append(" — %.0f cm".format(it)) }
-                            },
+                            text = "Cible",
                             position = Position(y = 0.08f),
-                            textColor = color.toArgb(),
+                            textColor = TargetColor.toArgb(),
                         )
+                    }
+                }
+                comparedAnchors.forEachIndexed { index, anchor ->
+                    key(anchor) {
+                        val distanceCm = distancesCm.getOrNull(index)
+                        val color = distanceCm?.let { colorForRank(it, distancesCm) } ?: ClosestColor
+                        AnchorNode(anchor = anchor) {
+                            val marker = remember(materialLoader) {
+                                materialLoader.createColorInstance(color)
+                            }
+                            SideEffect { marker.setColor(color) }
+                            SphereNode(radius = 0.03f, materialInstance = marker)
+                            TextNode(
+                                text = buildString {
+                                    append("Objet ${index + 1}")
+                                    distanceCm?.let { append(" — %.0f cm".format(it)) }
+                                },
+                                position = Position(y = 0.08f),
+                                textColor = color.toArgb(),
+                            )
+                        }
                     }
                 }
             }
@@ -212,24 +275,72 @@ private fun ArMeasureScreen() {
             )
         }
 
-        Row(
+        if (!use3DMode) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                target2D?.let { drawCircle(color = TargetColor, radius = 26f, center = it.screenPoint) }
+                compared2D.forEachIndexed { index, obj ->
+                    val distanceCm = distances2DCm.getOrNull(index)
+                    val color = distanceCm?.let { colorForRank(it, distances2DCm) } ?: ClosestColor
+                    drawCircle(color = color, radius = 26f, center = obj.screenPoint)
+                }
+            }
+            target2D?.let { PointLabel(text = "Cible", color = TargetColor, point = it.screenPoint) }
+            compared2D.forEachIndexed { index, obj ->
+                val distanceCm = distances2DCm.getOrNull(index)
+                val color = distanceCm?.let { colorForRank(it, distances2DCm) } ?: ClosestColor
+                PointLabel(
+                    text = buildString {
+                        append("Objet ${index + 1}")
+                        distanceCm?.let { append(" — %.0f cm".format(it)) }
+                    },
+                    color = color,
+                    point = obj.screenPoint,
+                )
+            }
+        }
+
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 32.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Button(
                 onClick = {
-                    if (frozenBitmap == null) freezeFrame() else frozenBitmap = null
+                    use3DMode = !use3DMode
+                    resetMeasurement()
                 },
             ) {
-                Text(if (frozenBitmap == null) "Figer" else "Reprendre")
+                Text(if (use3DMode) "Mode : 3D" else "Mode : 2D")
             }
-            Button(onClick = { resetMeasurement() }) {
-                Text("Réinitialiser")
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    onClick = {
+                        if (frozenBitmap == null) freezeFrame() else frozenBitmap = null
+                    },
+                ) {
+                    Text(if (frozenBitmap == null) "Figer" else "Reprendre")
+                }
+                Button(onClick = { resetMeasurement() }) {
+                    Text("Réinitialiser")
+                }
             }
         }
     }
+}
+
+/** Text label anchored near a raw screen-pixel point (top-left origin, no density conversion). */
+@Composable
+private fun PointLabel(text: String, color: Color, point: Offset) {
+    Text(
+        text = text,
+        color = color,
+        modifier = Modifier
+            .offset { IntOffset((point.x + 24f).roundToInt(), (point.y - 24f).roundToInt()) }
+            .background(Color.Black.copy(alpha = 0.6f))
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+    )
 }
 
 /** Green for the closest compared object, red for the farthest, interpolated in between. */
