@@ -99,8 +99,10 @@ private fun ArMeasureScreen() {
     val surfaceMirrorer = rememberSurfaceMirrorer()
 
     fun resetMeasurement() {
-        targetAnchor?.detach()
-        comparedAnchors.forEach { it.detach() }
+        // AnchorNode already detaches its anchor as part of its own teardown when it leaves
+        // composition (AnchorNodeImpl.destroy() -> detachAnchor()); detaching it here ourselves,
+        // ahead of and separate from that, raced the node's per-frame update against an
+        // already-detached anchor before recomposition had actually removed it.
         targetAnchor = null
         comparedAnchors.clear()
         distancesCm = emptyList()

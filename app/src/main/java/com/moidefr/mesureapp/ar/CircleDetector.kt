@@ -14,12 +14,12 @@ import kotlin.math.roundToInt
 
 /**
  * Runs a Hough Circle Transform on a region of interest around ([tapX], [tapY]) — in the camera
- * image's own pixel coordinates, not screen coordinates — and returns the lowest point of the
- * circle that best matches the tapped object: an approximation of where it touches the ground.
+ * image's own pixel coordinates, not screen coordinates — and returns the center of the circle
+ * that best matches the tapped object.
  *
  * Returns null if no circle is found in the ROI.
  */
-fun detectGroundContactPoint(
+fun detectObjectCenter(
     image: Image,
     tapX: Float,
     tapY: Float,
@@ -90,6 +90,5 @@ fun detectGroundContactPoint(
     val chosen = best ?: return null
     val centerX = roiX + chosen[0]
     val centerY = roiY + chosen[1]
-    val radius = chosen[2]
-    return PointF(centerX.toFloat(), (centerY + radius).toFloat())
+    return PointF(centerX.toFloat(), centerY.toFloat())
 }

@@ -24,7 +24,11 @@ data class TapResult(val anchor: Anchor, val circleDetected: Boolean)
 
 /**
  * Tap (screen coords) -> ROI around the tap in the camera image -> Hough circle -> circle's
- * lowest point -> AR hit-test against the tracked ground plane -> anchor.
+ * center -> AR hit-test against the tracked ground plane -> anchor.
+ *
+ * The circle's center (not its bottom edge) is used as the ground point: the camera looks down
+ * at the play area roughly from above, so the object's silhouette bottom does not approximate
+ * its ground contact point the way it would from a shallow, eye-level viewing angle.
  *
  * The ROI size is scaled against a coarse hit-test distance estimate so a far-away object (whose
  * apparent radius in pixels is smaller) doesn't get searched with a window sized for a near one.
@@ -44,10 +48,10 @@ fun createAnchorFromTap(session: Session, frame: Frame, tap: Offset): TapResult?
         imagePoint,
     )
 
-    val groundContactPoint = try {
+    val objectCenter = try {
         val image = frame.acquireCameraImage()
         try {
-            detectGroundContactPoint(image, imagePoint[0], imagePoint[1], roiSize)
+            detectObjectCenter(image, imagePoint[0], imagePoint[1], roiSize)
         } finally {
             image.close()
         }
@@ -56,10 +60,10 @@ fun createAnchorFromTap(session: Session, frame: Frame, tap: Offset): TapResult?
     }
 
     val viewPoint = FloatArray(2)
-    if (groundContactPoint != null) {
+    if (objectCenter != null) {
         frame.transformCoordinates2d(
             Coordinates2d.IMAGE_PIXELS,
-            floatArrayOf(groundContactPoint.x, groundContactPoint.y),
+            floatArrayOf(objectCenter.x, objectCenter.y),
             Coordinates2d.VIEW,
             viewPoint,
         )
@@ -70,7 +74,7 @@ fun createAnchorFromTap(session: Session, frame: Frame, tap: Offset): TapResult?
 
     val anchor = groundPlaneHit(frame.hitTest(viewPoint[0], viewPoint[1]))?.createAnchorOrNull()
         ?: return null
-    return TapResult(anchor, circleDetected = groundContactPoint != null)
+    return TapResult(anchor, circleDetected = objectCenter != null)
 }
 
 private fun groundPlaneHit(hits: List<HitResult>) = hits.firstByTypeOrNull(
