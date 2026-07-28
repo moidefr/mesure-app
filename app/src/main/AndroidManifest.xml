@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.CAMERA" />
 
@@ -13,8 +14,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MesureApp">
 
-        <!-- Tells the Play Store this app requires ARCore to be installed. -->
-        <meta-data android:name="com.google.ar.core" android:value="required" />
+        <!-- Tells the Play Store this app requires ARCore to be installed.
+             arsceneview's own manifest declares this meta-data as "optional",
+             so it must be explicitly overridden here. -->
+        <meta-data
+            android:name="com.google.ar.core"
+            android:value="required"
+            tools:replace="android:value" />
 
         <activity
             android:name=".MainActivity"
