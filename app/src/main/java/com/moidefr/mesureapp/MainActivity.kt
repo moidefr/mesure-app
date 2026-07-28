@@ -1,12 +1,18 @@
 package com.moidefr.mesureapp
 
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.media.ImageReader
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
@@ -25,14 +31,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
 import com.moidefr.mesureapp.ar.createAnchorFromTap
 import com.moidefr.mesureapp.ar.distanceBetween
+import com.moidefr.mesureapp.ar.rgbaImageToBitmap
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.material.setColor
@@ -42,6 +52,7 @@ import io.github.sceneview.node.TextNode
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberOnGestureListener
+import io.github.sceneview.rememberSurfaceMirrorer
 import org.opencv.android.OpenCVLoader
 
 private const val TAG = "MesureApp"
@@ -83,6 +94,10 @@ private fun ArMeasureScreen() {
     var pendingTap by remember { mutableStateOf<Offset?>(null) }
     var distancesCm by remember { mutableStateOf<List<Float>>(emptyList()) }
 
+    var boxSizePx by remember { mutableStateOf(IntSize.Zero) }
+    var frozenBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    val surfaceMirrorer = rememberSurfaceMirrorer()
+
     fun resetMeasurement() {
         targetAnchor?.detach()
         comparedAnchors.forEach { it.detach() }
@@ -91,11 +106,31 @@ private fun ArMeasureScreen() {
         distancesCm = emptyList()
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    fun freezeFrame() {
+        val size = boxSizePx
+        if (size.width <= 0 || size.height <= 0) return
+        val reader = ImageReader.newInstance(size.width, size.height, PixelFormat.RGBA_8888, 2)
+        reader.setOnImageAvailableListener({ r ->
+            r.acquireLatestImage()?.let { image ->
+                frozenBitmap = rgbaImageToBitmap(image)
+                image.close()
+            }
+            surfaceMirrorer.stopMirroring(r.surface)
+            r.close()
+        }, null)
+        surfaceMirrorer.startMirroring(reader.surface, width = size.width, height = size.height)
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { boxSizePx = it },
+    ) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
             materialLoader = materialLoader,
+            surfaceMirrorer = surfaceMirrorer,
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
             onGestureListener = rememberOnGestureListener(
                 onSingleTapConfirmed = { motionEvent, _ ->
@@ -167,13 +202,30 @@ private fun ArMeasureScreen() {
             }
         }
 
-        Button(
-            onClick = { resetMeasurement() },
+        frozenBitmap?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+
+        Row(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 32.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Réinitialiser")
+            Button(
+                onClick = {
+                    if (frozenBitmap == null) freezeFrame() else frozenBitmap = null
+                },
+            ) {
+                Text(if (frozenBitmap == null) "Figer" else "Reprendre")
+            }
+            Button(onClick = { resetMeasurement() }) {
+                Text("Réinitialiser")
+            }
         }
     }
 }
