@@ -2,40 +2,53 @@ package com.moidefr.mesureapp
 
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
-import com.google.ar.core.Coordinates2d
-import com.google.ar.core.Frame
-import com.google.ar.core.Plane
-import com.google.ar.core.Session
-import com.google.ar.core.exceptions.NotYetAvailableException
-import com.moidefr.mesureapp.ar.detectGroundContactPoint
+import com.moidefr.mesureapp.ar.createAnchorFromTap
+import com.moidefr.mesureapp.ar.distanceBetween
 import io.github.sceneview.ar.ARSceneView
-import io.github.sceneview.ar.arcore.createAnchorOrNull
-import io.github.sceneview.ar.arcore.firstByTypeOrNull
 import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.material.setColor
+import io.github.sceneview.math.Position
 import io.github.sceneview.node.SphereNode
+import io.github.sceneview.node.TextNode
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberOnGestureListener
 import org.opencv.android.OpenCVLoader
 
 private const val TAG = "MesureApp"
+
+private val TargetColor = Color(0xFF2196F3)
+private val ClosestColor = Color(0xFF2ECC71)
+private val FarthestColor = Color(0xFFE74C3C)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,7 +60,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    ArTapScreen()
+                    ArMeasureScreen()
                 }
             }
         }
@@ -55,92 +68,122 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * Validates the tap -> Hough circle -> AR hit-test -> 3D anchor pipeline: every tap drops a
- * marker at the detected object's ground-contact point. No distance/color logic yet.
+ * First tap sets the target (cochonnet); every following tap adds a compared object (boule /
+ * palet). Each compared object is colored on a green (closest to target) -> red (farthest)
+ * gradient and labeled with its distance to the target, in cm.
  */
 @Composable
-private fun ArTapScreen() {
+private fun ArMeasureScreen() {
+    val context = LocalContext.current
     val engine = rememberEngine()
     val materialLoader = rememberMaterialLoader(engine)
-    val markerMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(Color.Yellow)
+
+    var targetAnchor by remember { mutableStateOf<Anchor?>(null) }
+    val comparedAnchors = remember { mutableStateListOf<Anchor>() }
+    var pendingTap by remember { mutableStateOf<Offset?>(null) }
+    var distancesCm by remember { mutableStateOf<List<Float>>(emptyList()) }
+
+    fun resetMeasurement() {
+        targetAnchor?.detach()
+        comparedAnchors.forEach { it.detach() }
+        targetAnchor = null
+        comparedAnchors.clear()
+        distancesCm = emptyList()
     }
 
-    var pendingTap by remember { mutableStateOf<Offset?>(null) }
-    val anchors = remember { mutableStateListOf<Anchor>() }
+    Box(modifier = Modifier.fillMaxSize()) {
+        ARSceneView(
+            modifier = Modifier.fillMaxSize(),
+            engine = engine,
+            materialLoader = materialLoader,
+            planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
+            onGestureListener = rememberOnGestureListener(
+                onSingleTapConfirmed = { motionEvent, _ ->
+                    pendingTap = Offset(motionEvent.x, motionEvent.y)
+                },
+            ),
+            onSessionUpdated = { session, frame ->
+                pendingTap?.let { tap ->
+                    pendingTap = null
+                    val result = createAnchorFromTap(session, frame, tap)
+                    if (result != null) {
+                        if (!result.circleDetected) {
+                            Toast.makeText(
+                                context,
+                                "Objet non détecté, point approximatif utilisé",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                        val currentTarget = targetAnchor
+                        if (currentTarget == null) {
+                            targetAnchor = result.anchor
+                        } else {
+                            comparedAnchors.add(result.anchor)
+                        }
+                    }
+                }
 
-    ARSceneView(
-        modifier = Modifier.fillMaxSize(),
-        engine = engine,
-        materialLoader = materialLoader,
-        planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
-        onGestureListener = rememberOnGestureListener(
-            onSingleTapConfirmed = { motionEvent, _ ->
-                pendingTap = Offset(motionEvent.x, motionEvent.y)
+                val target = targetAnchor
+                distancesCm = if (target != null) {
+                    comparedAnchors.map { distanceBetween(it, target) * 100f }
+                } else {
+                    emptyList()
+                }
             },
-        ),
-        onSessionUpdated = { session, frame ->
-            pendingTap?.let { tap ->
-                pendingTap = null
-                createAnchorFromTap(session, frame, tap)?.let { anchor ->
-                    anchors.add(anchor)
+        ) {
+            targetAnchor?.let { anchor ->
+                AnchorNode(anchor = anchor) {
+                    val marker = remember(materialLoader) {
+                        materialLoader.createColorInstance(TargetColor)
+                    }
+                    SphereNode(radius = 0.03f, materialInstance = marker)
+                    TextNode(
+                        text = "Cible",
+                        position = Position(y = 0.08f),
+                        textColor = TargetColor.toArgb(),
+                    )
                 }
             }
-        },
-    ) {
-        anchors.forEach { anchor ->
-            AnchorNode(anchor = anchor) {
-                SphereNode(radius = 0.03f, materialInstance = markerMaterial)
+            comparedAnchors.forEachIndexed { index, anchor ->
+                key(anchor) {
+                    val distanceCm = distancesCm.getOrNull(index)
+                    val color = distanceCm?.let { colorForRank(it, distancesCm) } ?: ClosestColor
+                    AnchorNode(anchor = anchor) {
+                        val marker = remember(materialLoader) {
+                            materialLoader.createColorInstance(color)
+                        }
+                        SideEffect { marker.setColor(color) }
+                        SphereNode(radius = 0.03f, materialInstance = marker)
+                        TextNode(
+                            text = buildString {
+                                append("Objet ${index + 1}")
+                                distanceCm?.let { append(" — %.0f cm".format(it)) }
+                            },
+                            position = Position(y = 0.08f),
+                            textColor = color.toArgb(),
+                        )
+                    }
+                }
             }
+        }
+
+        Button(
+            onClick = { resetMeasurement() },
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 32.dp),
+        ) {
+            Text("Réinitialiser")
         }
     }
 }
 
-/**
- * Tap (screen coords) -> ROI around the tap in the camera image -> Hough circle -> circle's
- * lowest point -> AR hit-test against the tracked ground plane -> anchor.
- */
-private fun createAnchorFromTap(session: Session, frame: Frame, tap: Offset): Anchor? {
-    val imagePoint = FloatArray(2)
-    frame.transformCoordinates2d(
-        Coordinates2d.VIEW,
-        floatArrayOf(tap.x, tap.y),
-        Coordinates2d.IMAGE_PIXELS,
-        imagePoint,
-    )
-
-    val groundContactPoint = try {
-        val image = frame.acquireCameraImage()
-        try {
-            detectGroundContactPoint(image, imagePoint[0], imagePoint[1])
-        } finally {
-            image.close()
-        }
-    } catch (e: NotYetAvailableException) {
-        Log.w(TAG, "Camera image not yet available for tap processing", e)
-        null
-    }
-
-    val viewPoint = FloatArray(2)
-    if (groundContactPoint != null) {
-        frame.transformCoordinates2d(
-            Coordinates2d.IMAGE_PIXELS,
-            floatArrayOf(groundContactPoint.x, groundContactPoint.y),
-            Coordinates2d.VIEW,
-            viewPoint,
-        )
-    } else {
-        Log.d(TAG, "No circle detected around tap, falling back to the raw tap point")
-        viewPoint[0] = tap.x
-        viewPoint[1] = tap.y
-    }
-
-    return frame.hitTest(viewPoint[0], viewPoint[1])
-        .firstByTypeOrNull(
-            planeTypes = setOf(Plane.Type.HORIZONTAL_UPWARD_FACING),
-            point = false,
-            depthPoint = false,
-            instantPlacementPoint = false,
-        )
-        ?.createAnchorOrNull()
+/** Green for the closest compared object, red for the farthest, interpolated in between. */
+private fun colorForRank(distanceCm: Float, allDistancesCm: List<Float>): Color {
+    if (allDistancesCm.size <= 1) return ClosestColor
+    val min = allDistancesCm.min()
+    val max = allDistancesCm.max()
+    if (max - min < 0.0001f) return ClosestColor
+    val t = ((distanceCm - min) / (max - min)).coerceIn(0f, 1f)
+    return lerp(ClosestColor, FarthestColor, t)
 }
