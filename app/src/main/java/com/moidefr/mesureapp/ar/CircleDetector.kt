@@ -12,19 +12,22 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+/** A circle found by Hough, in the camera image's own pixel coordinates. */
+data class DetectedCircle(val centerX: Float, val centerY: Float, val radius: Float)
+
 /**
  * Runs a Hough Circle Transform on a region of interest around ([tapX], [tapY]) — in the camera
- * image's own pixel coordinates, not screen coordinates — and returns the center of the circle
- * that best matches the tapped object.
+ * image's own pixel coordinates, not screen coordinates — and returns every circle Hough found in
+ * that ROI (empty if none). Exposed separately from [detectObjectCenter] so a debug view can show
+ * every candidate, not just the one that gets picked.
  *
- * Returns null if no circle is found in the ROI.
+ * Measured empirically against real outdoor test photos (pétanque board, dead leaves, grass):
+ * a whole-frame scan is unusably noisy (hundreds of false circles from leaf/grass texture), but a
+ * tight ROI like this one reliably finds real objects, provided minRadius isn't set too high —
+ * `roiSize / 10` used to exclude legitimately-sized objects outright (e.g. a 32px-radius puck in a
+ * 400px ROI was rejected by a 40px floor).
  */
-fun detectObjectCenter(
-    image: Image,
-    tapX: Float,
-    tapY: Float,
-    roiSize: Int = 400,
-): PointF? {
+fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSize: Int): List<DetectedCircle> {
     val plane = image.planes[0]
     val rowStride = plane.rowStride
     val width = image.width
@@ -41,13 +44,13 @@ fun detectObjectCenter(
     val imageMat = fullMat.submat(Rect(0, 0, width, height))
 
     val half = roiSize / 2
-    val roiX = (tapX.roundToInt() - half).coerceIn(0, max(0, width - 1))
-    val roiY = (tapY.roundToInt() - half).coerceIn(0, max(0, height - 1))
+    val roiX = (roiCenterX.roundToInt() - half).coerceIn(0, max(0, width - 1))
+    val roiY = (roiCenterY.roundToInt() - half).coerceIn(0, max(0, height - 1))
     val roiWidth = min(roiSize, width - roiX)
     val roiHeight = min(roiSize, height - roiY)
     if (roiWidth <= 0 || roiHeight <= 0) {
         fullMat.release()
-        return null
+        return emptyList()
     }
 
     val roiMat = imageMat.submat(Rect(roiX, roiY, roiWidth, roiHeight))
@@ -63,23 +66,13 @@ fun detectObjectCenter(
         blurred.rows() / 8.0,
         100.0,
         30.0,
-        roiSize / 10,
+        max(10, roiSize / 20),
         roiSize / 2,
     )
 
-    // The tap is the best guess of where the object is; among the circles Hough found in the
-    // ROI, keep the one whose center falls closest to the tap.
-    val tapInRoiX = tapX - roiX
-    val tapInRoiY = tapY - roiY
-    var best: DoubleArray? = null
-    var bestDistance = Double.MAX_VALUE
-    for (i in 0 until circles.cols()) {
-        val circle = circles.get(0, i)
-        val distance = hypot(circle[0] - tapInRoiX, circle[1] - tapInRoiY)
-        if (distance < bestDistance) {
-            bestDistance = distance
-            best = circle
-        }
+    val result = (0 until circles.cols()).map { i ->
+        val c = circles.get(0, i)
+        DetectedCircle(roiX + c[0].toFloat(), roiY + c[1].toFloat(), c[2].toFloat())
     }
 
     fullMat.release()
@@ -87,8 +80,17 @@ fun detectObjectCenter(
     blurred.release()
     circles.release()
 
-    val chosen = best ?: return null
-    val centerX = roiX + chosen[0]
-    val centerY = roiY + chosen[1]
-    return PointF(centerX.toFloat(), centerY.toFloat())
+    return result
+}
+
+/**
+ * Among the circles Hough finds in a ROI around ([tapX], [tapY]), returns the center of the one
+ * closest to the tap — an approximation of which real object was tapped. Returns null if no
+ * circle is found in the ROI.
+ */
+fun detectObjectCenter(image: Image, tapX: Float, tapY: Float, roiSize: Int = 400): PointF? {
+    val closest = detectCirclesInRoi(image, tapX, tapY, roiSize)
+        .minByOrNull { hypot((it.centerX - tapX).toDouble(), (it.centerY - tapY).toDouble()) }
+        ?: return null
+    return PointF(closest.centerX, closest.centerY)
 }

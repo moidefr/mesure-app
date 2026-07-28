@@ -11,6 +11,7 @@ import com.google.ar.core.exceptions.NotYetAvailableException
 import io.github.sceneview.ar.arcore.createAnchorOrNull
 import io.github.sceneview.ar.arcore.distance
 import io.github.sceneview.ar.arcore.firstByTypeOrNull
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -39,11 +40,7 @@ data class DetectedTap(val imagePoint: PointF, val viewPoint: Offset, val circle
  * apparent radius in pixels is smaller) doesn't get searched with a window sized for a near one.
  */
 fun detectTap(frame: Frame, tap: Offset): DetectedTap {
-    val coarseDistance = groundPlaneHit(frame.hitTest(tap.x, tap.y))?.distance
-        ?.coerceIn(0.2f, 5f) ?: REFERENCE_DISTANCE_METERS
-    val roiSize = (REFERENCE_ROI_SIZE * (REFERENCE_DISTANCE_METERS / coarseDistance))
-        .roundToInt()
-        .coerceIn(MIN_ROI_SIZE, MAX_ROI_SIZE)
+    val roiSize = estimateRoiSize(frame, tap)
 
     val imagePoint = FloatArray(2)
     frame.transformCoordinates2d(
@@ -78,6 +75,67 @@ fun detectTap(frame: Frame, tap: Offset): DetectedTap {
         viewPoint = Offset(viewPoint[0], viewPoint[1]),
         circleDetected = objectCenter != null,
     )
+}
+
+private fun estimateRoiSize(frame: Frame, tap: Offset): Int {
+    val coarseDistance = groundPlaneHit(frame.hitTest(tap.x, tap.y))?.distance
+        ?.coerceIn(0.2f, 5f) ?: REFERENCE_DISTANCE_METERS
+    return (REFERENCE_ROI_SIZE * (REFERENCE_DISTANCE_METERS / coarseDistance))
+        .roundToInt()
+        .coerceIn(MIN_ROI_SIZE, MAX_ROI_SIZE)
+}
+
+/** A Hough candidate circle, in screen coordinates — for the debug "Détecter" overlay. */
+data class DebugCircle(val center: Offset, val radius: Float)
+
+/**
+ * Debug helper: runs the same ROI + Hough pass as [detectTap] around [tap], but returns every
+ * candidate circle found instead of only the one closest to the tap. Use this to see what the
+ * detector actually sees, rather than trusting the single pick silently.
+ */
+fun detectDebugCandidates(frame: Frame, tap: Offset): List<DebugCircle> {
+    val roiSize = estimateRoiSize(frame, tap)
+
+    val imagePoint = FloatArray(2)
+    frame.transformCoordinates2d(
+        Coordinates2d.VIEW,
+        floatArrayOf(tap.x, tap.y),
+        Coordinates2d.IMAGE_PIXELS,
+        imagePoint,
+    )
+
+    val circles = try {
+        val image = frame.acquireCameraImage()
+        try {
+            detectCirclesInRoi(image, imagePoint[0], imagePoint[1], roiSize)
+        } finally {
+            image.close()
+        }
+    } catch (e: NotYetAvailableException) {
+        emptyList()
+    }
+
+    return circles.map { circle ->
+        val centerView = FloatArray(2)
+        frame.transformCoordinates2d(
+            Coordinates2d.IMAGE_PIXELS,
+            floatArrayOf(circle.centerX, circle.centerY),
+            Coordinates2d.VIEW,
+            centerView,
+        )
+        val edgeView = FloatArray(2)
+        frame.transformCoordinates2d(
+            Coordinates2d.IMAGE_PIXELS,
+            floatArrayOf(circle.centerX + circle.radius, circle.centerY),
+            Coordinates2d.VIEW,
+            edgeView,
+        )
+        val viewRadius = hypot(
+            (edgeView[0] - centerView[0]).toDouble(),
+            (edgeView[1] - centerView[1]).toDouble(),
+        ).toFloat()
+        DebugCircle(Offset(centerView[0], centerView[1]), viewRadius)
+    }
 }
 
 /** AR hit-test against the tracked ground plane at the detected point -> 3D anchor. */

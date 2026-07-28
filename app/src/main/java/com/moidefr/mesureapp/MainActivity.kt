@@ -13,6 +13,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,7 +49,9 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
+import com.moidefr.mesureapp.ar.DebugCircle
 import com.moidefr.mesureapp.ar.createAnchorFromDetectedTap
+import com.moidefr.mesureapp.ar.detectDebugCandidates
 import com.moidefr.mesureapp.ar.detectTap
 import com.moidefr.mesureapp.ar.distanceBetween
 import com.moidefr.mesureapp.ar.hitTestDistance
@@ -126,6 +129,10 @@ private fun ArMeasureScreen() {
     var metersPerImagePixel by remember { mutableStateOf<Float?>(null) }
     var distances2DCm by remember { mutableStateOf<List<Float>>(emptyList()) }
 
+    // Debug: shows every Hough candidate around a tap instead of just the one picked.
+    var debugMode by remember { mutableStateOf(false) }
+    val debugCircles = remember { mutableStateListOf<DebugCircle>() }
+
     var pendingTap by remember { mutableStateOf<Offset?>(null) }
     var boxSizePx by remember { mutableStateOf(IntSize.Zero) }
     var frozenBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -139,6 +146,7 @@ private fun ArMeasureScreen() {
         compared2D.clear()
         metersPerImagePixel = null
         distances2DCm = emptyList()
+        debugCircles.clear()
     }
 
     fun freezeFrame() {
@@ -176,35 +184,40 @@ private fun ArMeasureScreen() {
             onSessionUpdated = { _, frame ->
                 pendingTap?.let { tap ->
                     pendingTap = null
-                    val detected = detectTap(frame, tap)
-                    if (!detected.circleDetected) {
-                        Toast.makeText(
-                            context,
-                            "Objet non détecté, point approximatif utilisé",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                    if (use3DMode) {
-                        createAnchorFromDetectedTap(frame, detected)?.let { anchor ->
-                            if (targetAnchor == null) {
-                                targetAnchor = anchor
-                            } else {
-                                comparedAnchors.add(anchor)
-                            }
-                        }
+                    if (debugMode) {
+                        debugCircles.clear()
+                        debugCircles.addAll(detectDebugCandidates(frame, tap))
                     } else {
-                        if (metersPerImagePixel == null) {
-                            hitTestDistance(frame, detected)?.let { depthMeters ->
-                                val focalLengthPx = frame.camera.imageIntrinsics.focalLength
-                                val avgFocalLengthPx = (focalLengthPx[0] + focalLengthPx[1]) / 2f
-                                metersPerImagePixel = depthMeters / avgFocalLengthPx
-                            }
+                        val detected = detectTap(frame, tap)
+                        if (!detected.circleDetected) {
+                            Toast.makeText(
+                                context,
+                                "Objet non détecté, point approximatif utilisé",
+                                Toast.LENGTH_SHORT,
+                            ).show()
                         }
-                        val point = MeasuredPoint2D(detected.imagePoint, detected.viewPoint)
-                        if (target2D == null) {
-                            target2D = point
+                        if (use3DMode) {
+                            createAnchorFromDetectedTap(frame, detected)?.let { anchor ->
+                                if (targetAnchor == null) {
+                                    targetAnchor = anchor
+                                } else {
+                                    comparedAnchors.add(anchor)
+                                }
+                            }
                         } else {
-                            compared2D.add(point)
+                            if (metersPerImagePixel == null) {
+                                hitTestDistance(frame, detected)?.let { depthMeters ->
+                                    val focalLengthPx = frame.camera.imageIntrinsics.focalLength
+                                    val avgFocalLengthPx = (focalLengthPx[0] + focalLengthPx[1]) / 2f
+                                    metersPerImagePixel = depthMeters / avgFocalLengthPx
+                                }
+                            }
+                            val point = MeasuredPoint2D(detected.imagePoint, detected.viewPoint)
+                            if (target2D == null) {
+                                target2D = point
+                            } else {
+                                compared2D.add(point)
+                            }
                         }
                     }
                 }
@@ -299,6 +312,20 @@ private fun ArMeasureScreen() {
             }
         }
 
+        if (debugCircles.isNotEmpty()) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                debugCircles.forEach { circle ->
+                    drawCircle(
+                        color = Color.Yellow,
+                        radius = circle.radius,
+                        center = circle.center,
+                        style = Stroke(width = 4f),
+                    )
+                    drawCircle(color = Color.Yellow, radius = 6f, center = circle.center)
+                }
+            }
+        }
+
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -325,6 +352,21 @@ private fun ArMeasureScreen() {
                 Button(onClick = { resetMeasurement() }) {
                     Text("Réinitialiser")
                 }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    debugMode = !debugMode
+                    debugCircles.clear()
+                },
+            ) {
+                Text(if (debugMode) "Détecter (actif)" else "Détecter")
+            }
+            if (debugMode) {
+                Text(
+                    text = "${debugCircles.size} cercle(s) trouvé(s) — tape un point pour scanner sa zone",
+                    color = Color.Yellow,
+                )
             }
         }
     }
