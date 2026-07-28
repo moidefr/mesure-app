@@ -41,19 +41,18 @@ private const val MIN_CIRCULARITY = 0.6
  * Returns every candidate that passes, not just the best match — a debug view can show them all;
  * [detectObjectCenter] below picks the one closest to the tap for actual use.
  *
- * [minRadius]/[maxRadius] (pixels) should bracket the real object's actual apparent size at the
- * tap's estimated depth (see ArTapPipeline's physically-grounded sizing) — a size-agnostic bound
- * like a fraction of [roiSize] let large, low-detail regions (a shadow edge, a plank-seam split)
- * pass the circularity filter by accident when the ROI happened to be sized generously.
+ * Sizing the min/max radius off the object's real-world size projected through the estimated
+ * depth (focal length / depth) sounds more principled, but a single ground-plane hit-test is a
+ * fragile depth reading — tested against a real photo where the true object radius was ~85px, a
+ * depth misestimate made that projection expect ~20px, so the real object got excluded by the
+ * size filter and small noise speckles got picked up instead. Bounds relative to [roiSize] are
+ * more robust in practice (the ROI itself is still sized off the depth estimate, just more
+ * forgivingly). What *did* need fixing after reverting to that is the failure mode it originally
+ * had: a large, low-detail region (a shadow edge, a plank seam) passing the circularity filter by
+ * accident because it happened to fit under a generous ROI-relative max size — now separately
+ * rejected below by checking whether the shape's bounding box spans most of the ROI.
  */
-fun detectCirclesInRoi(
-    image: Image,
-    roiCenterX: Float,
-    roiCenterY: Float,
-    roiSize: Int,
-    minRadius: Int,
-    maxRadius: Int,
-): List<DetectedCircle> {
+fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSize: Int): List<DetectedCircle> {
     val plane = image.planes[0]
     val rowStride = plane.rowStride
     val width = image.width
@@ -83,6 +82,8 @@ fun detectCirclesInRoi(
     val blurred = Mat()
     Imgproc.GaussianBlur(roiMat, blurred, Size(5.0, 5.0), 0.0)
 
+    val minRadius = max(15, roiSize / 25)
+    val maxRadius = (roiSize * 0.42).roundToInt()
     val minArea = Math.PI * minRadius * minRadius
     val maxArea = Math.PI * maxRadius * maxRadius
 
@@ -102,22 +103,29 @@ fun detectCirclesInRoi(
         for (contour in contours) {
             val area = Imgproc.contourArea(contour)
             if (area in minArea..maxArea) {
-                val contour2f = MatOfPoint2f(*contour.toArray())
-                val perimeter = Imgproc.arcLength(contour2f, true)
-                if (perimeter > 0.0) {
-                    val circularity = 4.0 * Math.PI * area / (perimeter * perimeter)
-                    if (circularity >= MIN_CIRCULARITY) {
-                        val center = Point()
-                        val radius = FloatArray(1)
-                        Imgproc.minEnclosingCircle(contour2f, center, radius)
-                        result += DetectedCircle(
-                            centerX = (roiX + center.x).toFloat(),
-                            centerY = (roiY + center.y).toFloat(),
-                            radius = radius[0],
-                        )
+                val boundingRect = Imgproc.boundingRect(contour)
+                // A shape whose bounding box spans nearly the whole ROI is a large, low-detail
+                // region (a shadow edge, a plank seam) rather than an isolated small object,
+                // regardless of how circular its silhouette happens to measure.
+                val spansRoi = boundingRect.width > 0.85 * roiWidth || boundingRect.height > 0.85 * roiHeight
+                if (!spansRoi) {
+                    val contour2f = MatOfPoint2f(*contour.toArray())
+                    val perimeter = Imgproc.arcLength(contour2f, true)
+                    if (perimeter > 0.0) {
+                        val circularity = 4.0 * Math.PI * area / (perimeter * perimeter)
+                        if (circularity >= MIN_CIRCULARITY) {
+                            val center = Point()
+                            val radius = FloatArray(1)
+                            Imgproc.minEnclosingCircle(contour2f, center, radius)
+                            result += DetectedCircle(
+                                centerX = (roiX + center.x).toFloat(),
+                                centerY = (roiY + center.y).toFloat(),
+                                radius = radius[0],
+                            )
+                        }
                     }
+                    contour2f.release()
                 }
-                contour2f.release()
             }
             contour.release()
         }
@@ -138,15 +146,8 @@ fun detectCirclesInRoi(
  * Among the objects found in a ROI around ([tapX], [tapY]), returns the center of the one closest
  * to the tap — an approximation of which real object was tapped. Returns null if none is found.
  */
-fun detectObjectCenter(
-    image: Image,
-    tapX: Float,
-    tapY: Float,
-    roiSize: Int,
-    minRadius: Int,
-    maxRadius: Int,
-): PointF? {
-    val closest = detectCirclesInRoi(image, tapX, tapY, roiSize, minRadius, maxRadius)
+fun detectObjectCenter(image: Image, tapX: Float, tapY: Float, roiSize: Int): PointF? {
+    val closest = detectCirclesInRoi(image, tapX, tapY, roiSize)
         .minByOrNull { hypot((it.centerX - tapX).toDouble(), (it.centerY - tapY).toDouble()) }
         ?: return null
     return PointF(closest.centerX, closest.centerY)

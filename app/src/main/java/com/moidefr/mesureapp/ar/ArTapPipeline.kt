@@ -15,16 +15,9 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/**
- * A palet breton is ~7cm across; this leaves enough margin either side for pétanque boules too,
- * while staying tight enough that a shadow edge or plank seam can no longer masquerade as the
- * object just because it happens to be roughly circular.
- */
-private const val EXPECTED_OBJECT_RADIUS_METERS = 0.035f
-private const val MIN_RADIUS_SCALE = 0.4f
-private const val MAX_RADIUS_SCALE = 2.2f
-private const val ROI_MARGIN_SCALE = 6f
+/** Reference apparent object size: at 1 m, a 400 px-wide ROI covers a palet/boule comfortably. */
 private const val REFERENCE_DISTANCE_METERS = 1f
+private const val REFERENCE_ROI_SIZE = 400
 private const val MIN_ROI_SIZE = 120
 private const val MAX_ROI_SIZE = 900
 
@@ -35,31 +28,25 @@ private const val MAX_ROI_SIZE = 900
  */
 data class DetectedTap(val imagePoint: PointF, val viewPoint: Offset, val circleDetected: Boolean)
 
-private data class RoiPlan(val roiSize: Int, val minRadiusPx: Int, val maxRadiusPx: Int)
-
 /**
- * Projects [EXPECTED_OBJECT_RADIUS_METERS] to pixels at the tap's estimated depth (pinhole camera
- * model: apparent radius = focalLengthPx * realRadiusMeters / depthMeters), then derives a ROI and
- * a min/max radius bound around that expected size.
+ * Sizes the search window off a coarse hit-test depth estimate, so a far-away object (whose
+ * apparent radius in pixels is smaller) doesn't get searched with a window sized for a near one.
  *
- * Sizing the ROI/radius bounds off a fraction of an arbitrary reference ROI (rather than the
- * object's actual expected apparent size) let large, low-detail regions — a shadow edge, a plank
- * seam — pass the circularity filter purely because the search window happened to be sized
- * generously; that showed up as a huge false "circle" spanning most of the ROI in testing.
+ * This used to also derive the detector's min/max radius filter from the same depth estimate,
+ * projecting a real-world object size through the pinhole camera model. That's more principled in
+ * theory, but a single ground-plane hit-test is a fragile depth reading in practice — tested
+ * against a real photo where a misestimate made the projection expect a ~20px radius when the
+ * real object measured ~85px, excluding the real object from the size filter entirely. The size
+ * filter itself now stays relative to the ROI (see CircleDetector); only this search-window size
+ * is depth-adaptive, where being a bit off just means a little more or less to search, not an
+ * outright miss.
  */
-private fun planRoi(frame: Frame, tap: Offset): RoiPlan {
+private fun estimateRoiSize(frame: Frame, tap: Offset): Int {
     val coarseDistance = groundPlaneHit(frame.hitTest(tap.x, tap.y))?.distance
         ?.coerceIn(0.2f, 5f) ?: REFERENCE_DISTANCE_METERS
-    val focalLengthPx = frame.camera.imageIntrinsics.focalLength
-    val avgFocalLengthPx = (focalLengthPx[0] + focalLengthPx[1]) / 2f
-    val expectedRadiusPx = avgFocalLengthPx * EXPECTED_OBJECT_RADIUS_METERS / coarseDistance
-
-    val roiSize = (expectedRadiusPx * ROI_MARGIN_SCALE * 2f)
+    return (REFERENCE_ROI_SIZE * (REFERENCE_DISTANCE_METERS / coarseDistance))
         .roundToInt()
         .coerceIn(MIN_ROI_SIZE, MAX_ROI_SIZE)
-    val minRadiusPx = (expectedRadiusPx * MIN_RADIUS_SCALE).roundToInt().coerceAtLeast(8)
-    val maxRadiusPx = (expectedRadiusPx * MAX_RADIUS_SCALE).roundToInt().coerceAtLeast(minRadiusPx + 5)
-    return RoiPlan(roiSize, minRadiusPx, maxRadiusPx)
 }
 
 /**
@@ -71,7 +58,7 @@ private fun planRoi(frame: Frame, tap: Offset): RoiPlan {
  * its ground contact point the way it would from a shallow, eye-level viewing angle.
  */
 fun detectTap(frame: Frame, tap: Offset): DetectedTap {
-    val plan = planRoi(frame, tap)
+    val roiSize = estimateRoiSize(frame, tap)
 
     val imagePoint = FloatArray(2)
     frame.transformCoordinates2d(
@@ -84,7 +71,7 @@ fun detectTap(frame: Frame, tap: Offset): DetectedTap {
     val objectCenter = try {
         val image = frame.acquireCameraImage()
         try {
-            detectObjectCenter(image, imagePoint[0], imagePoint[1], plan.roiSize, plan.minRadiusPx, plan.maxRadiusPx)
+            detectObjectCenter(image, imagePoint[0], imagePoint[1], roiSize)
         } finally {
             image.close()
         }
@@ -117,7 +104,7 @@ data class DebugCircle(val center: Offset, val radius: Float)
  * detector actually sees, rather than trusting the single pick silently.
  */
 fun detectDebugCandidates(frame: Frame, tap: Offset): List<DebugCircle> {
-    val plan = planRoi(frame, tap)
+    val roiSize = estimateRoiSize(frame, tap)
 
     val imagePoint = FloatArray(2)
     frame.transformCoordinates2d(
@@ -130,7 +117,7 @@ fun detectDebugCandidates(frame: Frame, tap: Offset): List<DebugCircle> {
     val circles = try {
         val image = frame.acquireCameraImage()
         try {
-            detectCirclesInRoi(image, imagePoint[0], imagePoint[1], plan.roiSize, plan.minRadiusPx, plan.maxRadiusPx)
+            detectCirclesInRoi(image, imagePoint[0], imagePoint[1], roiSize)
         } finally {
             image.close()
         }
