@@ -4,6 +4,9 @@ import android.graphics.PointF
 import android.media.Image
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
 import org.opencv.core.Rect
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
@@ -12,20 +15,31 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** A circle found by Hough, in the camera image's own pixel coordinates. */
+/** A detected object, in the camera image's own pixel coordinates. */
 data class DetectedCircle(val centerX: Float, val centerY: Float, val radius: Float)
 
+private const val MIN_CIRCULARITY = 0.6
+
 /**
- * Runs a Hough Circle Transform on a region of interest around ([tapX], [tapY]) — in the camera
- * image's own pixel coordinates, not screen coordinates — and returns every circle Hough found in
- * that ROI (empty if none). Exposed separately from [detectObjectCenter] so a debug view can show
- * every candidate, not just the one that gets picked.
+ * Finds round objects in a region of interest around ([roiCenterX], [roiCenterY]) — in the camera
+ * image's own pixel coordinates, not screen coordinates.
  *
- * Measured empirically against real outdoor test photos (pétanque board, dead leaves, grass):
- * a whole-frame scan is unusably noisy (hundreds of false circles from leaf/grass texture), but a
- * tight ROI like this one reliably finds real objects, provided minRadius isn't set too high —
- * `roiSize / 10` used to exclude legitimately-sized objects outright (e.g. a 32px-radius puck in a
- * 400px ROI was rejected by a 40px floor).
+ * This used to run a Hough Circle Transform directly on the ROI. Tested empirically against real
+ * outdoor photos (a pétanque board on grass/dead leaves, and separately a board with heavy router/
+ * saw-mark wood grain): Hough is unusably noisy on both — hundreds of false circles from leaf
+ * texture on the first, and on the second it fixated entirely on the wood-grain arcs and missed
+ * the real puck outright, regardless of blur/threshold tuning.
+ *
+ * What actually works on both test photos: Otsu-threshold the ROI in both directions (the object
+ * can be darker OR lighter than its surroundings — a black puck and a light board need opposite
+ * thresholds), clean up the small texture-noise blobs with a morphological open/close pass, then
+ * keep only the resulting contours whose shape is actually circular
+ * (`4π·area / perimeter²`, close to 1.0 for a real circle, low for the ragged blobs texture noise
+ * produces). This throws away the many small, ragged wood-grain/leaf-vein blobs that a plain
+ * threshold also picks up, while reliably keeping the one clean, round, puck-shaped blob.
+ *
+ * Returns every candidate that passes, not just the best match — a debug view can show them all;
+ * [detectObjectCenter] below picks the one closest to the tap for actual use.
  */
 fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSize: Int): List<DetectedCircle> {
     val plane = image.planes[0]
@@ -55,38 +69,64 @@ fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSi
 
     val roiMat = imageMat.submat(Rect(roiX, roiY, roiWidth, roiHeight))
     val blurred = Mat()
-    Imgproc.GaussianBlur(roiMat, blurred, Size(9.0, 9.0), 2.0)
+    Imgproc.GaussianBlur(roiMat, blurred, Size(5.0, 5.0), 0.0)
 
-    val circles = Mat()
-    Imgproc.HoughCircles(
-        blurred,
-        circles,
-        Imgproc.HOUGH_GRADIENT,
-        1.0,
-        blurred.rows() / 8.0,
-        100.0,
-        30.0,
-        max(10, roiSize / 20),
-        roiSize / 2,
-    )
+    val minRadius = max(10, roiSize / 20)
+    val maxRadius = roiSize / 2
+    val minArea = Math.PI * minRadius * minRadius
+    val maxArea = Math.PI * maxRadius * maxRadius
 
-    val result = (0 until circles.cols()).map { i ->
-        val c = circles.get(0, i)
-        DetectedCircle(roiX + c[0].toFloat(), roiY + c[1].toFloat(), c[2].toFloat())
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+    val result = mutableListOf<DetectedCircle>()
+
+    for (baseThresholdType in intArrayOf(Imgproc.THRESH_BINARY_INV, Imgproc.THRESH_BINARY)) {
+        val mask = Mat()
+        Imgproc.threshold(blurred, mask, 0.0, 255.0, baseThresholdType + Imgproc.THRESH_OTSU)
+        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_OPEN, kernel, Point(-1.0, -1.0), 2)
+        Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, kernel, Point(-1.0, -1.0), 2)
+
+        val contours = mutableListOf<MatOfPoint>()
+        val hierarchy = Mat()
+        Imgproc.findContours(mask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        for (contour in contours) {
+            val area = Imgproc.contourArea(contour)
+            if (area in minArea..maxArea) {
+                val contour2f = MatOfPoint2f(*contour.toArray())
+                val perimeter = Imgproc.arcLength(contour2f, true)
+                if (perimeter > 0.0) {
+                    val circularity = 4.0 * Math.PI * area / (perimeter * perimeter)
+                    if (circularity >= MIN_CIRCULARITY) {
+                        val center = Point()
+                        val radius = FloatArray(1)
+                        Imgproc.minEnclosingCircle(contour2f, center, radius)
+                        result += DetectedCircle(
+                            centerX = (roiX + center.x).toFloat(),
+                            centerY = (roiY + center.y).toFloat(),
+                            radius = radius[0],
+                        )
+                    }
+                }
+                contour2f.release()
+            }
+            contour.release()
+        }
+        hierarchy.release()
+        mask.release()
     }
 
+    kernel.release()
     fullMat.release()
+    imageMat.release()
     roiMat.release()
     blurred.release()
-    circles.release()
 
     return result
 }
 
 /**
- * Among the circles Hough finds in a ROI around ([tapX], [tapY]), returns the center of the one
- * closest to the tap — an approximation of which real object was tapped. Returns null if no
- * circle is found in the ROI.
+ * Among the objects found in a ROI around ([tapX], [tapY]), returns the center of the one closest
+ * to the tap — an approximation of which real object was tapped. Returns null if none is found.
  */
 fun detectObjectCenter(image: Image, tapX: Float, tapY: Float, roiSize: Int = 400): PointF? {
     val closest = detectCirclesInRoi(image, tapX, tapY, roiSize)

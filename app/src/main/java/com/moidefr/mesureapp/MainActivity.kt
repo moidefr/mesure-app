@@ -129,7 +129,7 @@ private fun ArMeasureScreen() {
     var metersPerImagePixel by remember { mutableStateOf<Float?>(null) }
     var distances2DCm by remember { mutableStateOf<List<Float>>(emptyList()) }
 
-    // Debug: shows every Hough candidate around a tap instead of just the one picked.
+    // Debug: shows every detection candidate around a tap instead of just the one picked.
     var debugMode by remember { mutableStateOf(false) }
     val debugCircles = remember { mutableStateListOf<DebugCircle>() }
 

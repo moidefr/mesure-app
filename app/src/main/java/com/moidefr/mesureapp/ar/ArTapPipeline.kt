@@ -29,7 +29,7 @@ private const val MAX_ROI_SIZE = 900
 data class DetectedTap(val imagePoint: PointF, val viewPoint: Offset, val circleDetected: Boolean)
 
 /**
- * Tap (screen coords) -> ROI around the tap in the camera image -> Hough circle -> circle's
+ * Tap (screen coords) -> ROI around the tap in the camera image -> circle detection -> circle's
  * center.
  *
  * The circle's center (not its bottom edge) is used as the object's point: the camera looks down
@@ -85,11 +85,11 @@ private fun estimateRoiSize(frame: Frame, tap: Offset): Int {
         .coerceIn(MIN_ROI_SIZE, MAX_ROI_SIZE)
 }
 
-/** A Hough candidate circle, in screen coordinates — for the debug "Détecter" overlay. */
+/** A candidate detected object, in screen coordinates — for the debug "Détecter" overlay. */
 data class DebugCircle(val center: Offset, val radius: Float)
 
 /**
- * Debug helper: runs the same ROI + Hough pass as [detectTap] around [tap], but returns every
+ * Debug helper: runs the same ROI + detection pass as [detectTap] around [tap], but returns every
  * candidate circle found instead of only the one closest to the tap. Use this to see what the
  * detector actually sees, rather than trusting the single pick silently.
  */
