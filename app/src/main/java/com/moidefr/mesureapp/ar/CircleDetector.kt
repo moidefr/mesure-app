@@ -40,8 +40,20 @@ private const val MIN_CIRCULARITY = 0.6
  *
  * Returns every candidate that passes, not just the best match — a debug view can show them all;
  * [detectObjectCenter] below picks the one closest to the tap for actual use.
+ *
+ * [minRadius]/[maxRadius] (pixels) should bracket the real object's actual apparent size at the
+ * tap's estimated depth (see ArTapPipeline's physically-grounded sizing) — a size-agnostic bound
+ * like a fraction of [roiSize] let large, low-detail regions (a shadow edge, a plank-seam split)
+ * pass the circularity filter by accident when the ROI happened to be sized generously.
  */
-fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSize: Int): List<DetectedCircle> {
+fun detectCirclesInRoi(
+    image: Image,
+    roiCenterX: Float,
+    roiCenterY: Float,
+    roiSize: Int,
+    minRadius: Int,
+    maxRadius: Int,
+): List<DetectedCircle> {
     val plane = image.planes[0]
     val rowStride = plane.rowStride
     val width = image.width
@@ -71,8 +83,6 @@ fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSi
     val blurred = Mat()
     Imgproc.GaussianBlur(roiMat, blurred, Size(5.0, 5.0), 0.0)
 
-    val minRadius = max(10, roiSize / 20)
-    val maxRadius = roiSize / 2
     val minArea = Math.PI * minRadius * minRadius
     val maxArea = Math.PI * maxRadius * maxRadius
 
@@ -128,8 +138,15 @@ fun detectCirclesInRoi(image: Image, roiCenterX: Float, roiCenterY: Float, roiSi
  * Among the objects found in a ROI around ([tapX], [tapY]), returns the center of the one closest
  * to the tap — an approximation of which real object was tapped. Returns null if none is found.
  */
-fun detectObjectCenter(image: Image, tapX: Float, tapY: Float, roiSize: Int = 400): PointF? {
-    val closest = detectCirclesInRoi(image, tapX, tapY, roiSize)
+fun detectObjectCenter(
+    image: Image,
+    tapX: Float,
+    tapY: Float,
+    roiSize: Int,
+    minRadius: Int,
+    maxRadius: Int,
+): PointF? {
+    val closest = detectCirclesInRoi(image, tapX, tapY, roiSize, minRadius, maxRadius)
         .minByOrNull { hypot((it.centerX - tapX).toDouble(), (it.centerY - tapY).toDouble()) }
         ?: return null
     return PointF(closest.centerX, closest.centerY)
